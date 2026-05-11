@@ -156,7 +156,7 @@ lucide-react/dist/esm/lucide-react.js:
 
 <script>
 /* ============================================================================
-   PAJARITOS PINNED ENHANCE v2 — features DENTRO de los slots pinned existentes
+   PAJARITOS PINNED ENHANCE v3 — detección agresiva, fallbacks múltiples
    ============================================================================ */
 (function() {
   'use strict';
@@ -177,20 +177,21 @@ lucide-react/dist/esm/lucide-react.js:
   let descriptionsCache = { left: '', right: '' };
   let modalEl = null;
   let currentSlotData = null;
-  let lastProcessedGrid = null;
 
-  async function sbFetch(path, options = {}) {
+  // ============================================================
+  // Supabase
+  // ============================================================
+  async function sbFetch(path, options) {
+    options = options || {};
     const url = SUPABASE_URL + '/rest/v1/' + path;
-    const res = await fetch(url, {
-      ...options,
-      headers: {
+    const res = await fetch(url, Object.assign({}, options, {
+      headers: Object.assign({
         'apikey': SUPABASE_KEY,
         'Authorization': 'Bearer ' + SUPABASE_KEY,
         'Content-Type': 'application/json',
         'Prefer': 'return=representation',
-        ...(options.headers || {}),
-      },
-    });
+      }, options.headers || {}),
+    }));
     if (!res.ok) {
       const errText = await res.text();
       throw new Error('Supabase ' + res.status + ': ' + errText);
@@ -203,7 +204,7 @@ lucide-react/dist/esm/lucide-react.js:
     try {
       const stored = localStorage.getItem('pajaritos_me');
       if (stored === 'vale' || stored === 'adrian') return stored;
-    } catch {}
+    } catch (e) {}
     return null;
   }
 
@@ -223,9 +224,9 @@ lucide-react/dist/esm/lucide-react.js:
     try {
       const items = await sbFetch('items?type=eq.pinned&order=created_at.desc');
       const arr = items || [];
-      const left = arr.find(i => (i.data && i.data.slot === 'left') || i.slot === 'left') || null;
-      const right = arr.find(i => (i.data && i.data.slot === 'right') || i.slot === 'right') || null;
-      pinnedItemsCache = { left, right };
+      const left = arr.find(function(i) { return (i.data && i.data.slot === 'left') || i.slot === 'left'; }) || null;
+      const right = arr.find(function(i) { return (i.data && i.data.slot === 'right') || i.slot === 'right'; }) || null;
+      pinnedItemsCache = { left: left, right: right };
       pinnedPhotoUrlsCache = {
         left: getPhotoUrlFromItem(left),
         right: getPhotoUrlFromItem(right),
@@ -234,8 +235,9 @@ lucide-react/dist/esm/lucide-react.js:
         left: (left && left.data && left.data.description) || '',
         right: (right && right.data && right.data.description) || '',
       };
+      console.log('[pinned-enhance v3] loaded items:', { left: !!left, right: !!right, leftUrl: !!pinnedPhotoUrlsCache.left, rightUrl: !!pinnedPhotoUrlsCache.right });
     } catch (e) {
-      console.error('[pinned-enhance] load failed:', e);
+      console.error('[pinned-enhance v3] load failed:', e);
     }
   }
 
@@ -243,14 +245,14 @@ lucide-react/dist/esm/lucide-react.js:
     try {
       const slotNum = slotKey === 'left' ? 1 : 2;
       return (await sbFetch('pinned_comments?pinned_slot=eq.' + slotNum + '&order=created_at.asc')) || [];
-    } catch { return []; }
+    } catch (e) { return []; }
   }
 
   async function loadHistory(slotKey) {
     try {
       const slotNum = slotKey === 'left' ? 1 : 2;
       return (await sbFetch('pinned_history?pinned_slot=eq.' + slotNum + '&order=uploaded_at.desc')) || [];
-    } catch { return []; }
+    } catch (e) { return []; }
   }
 
   async function addComment(slotKey, by, text) {
@@ -294,92 +296,170 @@ lucide-react/dist/esm/lucide-react.js:
     });
   }
 
-  function findPinnedGrid() {
-    const grids = document.querySelectorAll('.grid.grid-cols-2.gap-3');
-    for (const grid of grids) {
-      if (grid.children.length !== 2) continue;
-      const text = (grid.textContent || '').toLowerCase();
-      const hasImage = grid.querySelectorAll('img').length > 0;
-      const hasFoto = text.includes('+ foto') || text.includes('subiendo') || text.includes('cambiar');
-      const firstChild = grid.children[0];
-      const style = firstChild ? firstChild.getAttribute('style') || '' : '';
-      const isPinned = style.includes('4 / 5') || style.includes('aspect-ratio');
-      if ((hasFoto || hasImage) && isPinned) {
-        return grid;
+  // ============================================================
+  // DETECCIÓN AGRESIVA del slot pinned
+  // ============================================================
+  function findPinnedSlots() {
+    // Estrategia 1: buscar botones que digan "cambiar" (solo aparece en pinned con foto)
+    const slotsByButton = [];
+    const allButtons = document.querySelectorAll('button');
+    for (const btn of allButtons) {
+      const text = (btn.textContent || '').trim().toLowerCase();
+      if (text === 'cambiar') {
+        // Subir al padre que tenga aspect-ratio
+        let parent = btn.parentElement;
+        let depth = 0;
+        while (parent && depth < 8) {
+          const style = parent.getAttribute('style') || '';
+          if (style.indexOf('aspect-ratio') !== -1 || style.indexOf('4 / 5') !== -1 || style.indexOf('4/5') !== -1) {
+            slotsByButton.push(parent);
+            break;
+          }
+          parent = parent.parentElement;
+          depth++;
+        }
       }
     }
+
+    // Estrategia 2: buscar "+ foto" (slots vacíos)
+    const slotsByPlaceholder = [];
+    const allSpans = document.querySelectorAll('span, button, div');
+    for (const el of allSpans) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      if (text === '+ foto' || text === 'subiendo') {
+        let parent = el.parentElement;
+        let depth = 0;
+        while (parent && depth < 8) {
+          const style = parent.getAttribute('style') || '';
+          if (style.indexOf('aspect-ratio') !== -1 || style.indexOf('4 / 5') !== -1 || style.indexOf('4/5') !== -1) {
+            if (slotsByPlaceholder.indexOf(parent) === -1) slotsByPlaceholder.push(parent);
+            break;
+          }
+          parent = parent.parentElement;
+          depth++;
+        }
+      }
+    }
+
+    // Combinar y devolver slots únicos
+    const allSlots = slotsByButton.concat(slotsByPlaceholder);
+    const unique = [];
+    for (const s of allSlots) {
+      if (unique.indexOf(s) === -1) unique.push(s);
+    }
+
+    // Identificar left/right por posición (el que aparezca primero a la izquierda = left)
+    if (unique.length >= 2) {
+      // Ordenar por posición horizontal
+      unique.sort(function(a, b) {
+        const aRect = a.getBoundingClientRect();
+        const bRect = b.getBoundingClientRect();
+        return aRect.left - bRect.left;
+      });
+      return { left: unique[0], right: unique[1], hasPhoto: { left: slotsByButton.indexOf(unique[0]) !== -1, right: slotsByButton.indexOf(unique[1]) !== -1 } };
+    }
+
     return null;
   }
 
-  function enrichSlot(slotEl, slotKey) {
+  // ============================================================
+  // Enriquecer slot
+  // ============================================================
+  function enrichSlot(slotEl, slotKey, hasPhotoInDOM) {
     if (!slotEl) return;
     if (slotEl.querySelector('.pinned-enhance-tap-overlay')) return;
-    const hasPhoto = !!pinnedPhotoUrlsCache[slotKey];
+
+    // Solo enriquecer si el slot tiene foto (DOM o cache)
+    const hasPhoto = hasPhotoInDOM || !!pinnedPhotoUrlsCache[slotKey];
     if (!hasPhoto) return;
+
+    // Asegurar position relative
+    const computed = window.getComputedStyle(slotEl);
+    if (computed.position === 'static') {
+      slotEl.style.position = 'relative';
+    }
 
     slotEl.setAttribute('data-pinned-slot', slotKey);
 
+    // Tap overlay (transparente, cubre la imagen pero deja libre el botón "cambiar")
     const tapOverlay = document.createElement('button');
     tapOverlay.className = 'pinned-enhance-tap-overlay';
-    tapOverlay.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:calc(100% - 40px);background:transparent;border:none;cursor:pointer;z-index:5;padding:0;';
-    tapOverlay.addEventListener('click', (e) => {
+    tapOverlay.title = 'ver detalles';
+    tapOverlay.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:calc(100% - 44px);background:transparent;border:none;cursor:pointer;z-index:5;padding:0;';
+    tapOverlay.addEventListener('click', function(e) {
       e.preventDefault();
       e.stopPropagation();
       openPhotoModal(slotKey);
     });
     slotEl.appendChild(tapOverlay);
 
+    // Botón X borrar
     const delBtn = document.createElement('button');
     delBtn.className = 'pinned-enhance-delete';
+    delBtn.title = 'borrar foto';
     delBtn.innerHTML = '×';
-    delBtn.style.cssText = 'position:absolute;top:8px;left:8px;width:26px;height:26px;background:rgba(160,74,44,0.92);color:#fff;border:none;border-radius:999px;cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;z-index:10;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);padding:0;';
-    delBtn.addEventListener('click', async (e) => {
+    delBtn.style.cssText = 'position:absolute;top:8px;left:8px;width:28px;height:28px;background:rgba(160,74,44,0.95);color:#fff;border:none;border-radius:999px;cursor:pointer;font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center;z-index:10;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);padding:0;font-weight:300;';
+    delBtn.addEventListener('click', async function(e) {
       e.preventDefault();
       e.stopPropagation();
       if (!confirm('¿borrar esta foto? se guardará en el historial')) return;
       const item = pinnedItemsCache[slotKey];
       const url = pinnedPhotoUrlsCache[slotKey];
+      if (!item) {
+        flashError('no se encontró la foto en la base de datos');
+        return;
+      }
       try {
         await archiveToHistory(item, url);
         await deletePinnedItem(item.id);
-        flashSuccess('foto borrada');
-        setTimeout(() => location.reload(), 900);
+        flashSuccess('foto borrada, refrescando…');
+        setTimeout(function() { location.reload(); }, 900);
       } catch (err) {
         flashError('no se pudo borrar: ' + err.message);
       }
     });
     slotEl.appendChild(delBtn);
+
+    console.log('[pinned-enhance v3] enriched slot:', slotKey);
   }
 
-  function addDescriptionRow(grid) {
+  // ============================================================
+  // Agregar fila de descripciones debajo del grid
+  // ============================================================
+  function addDescriptionRow(leftSlot, rightSlot) {
+    // El grid es el padre común de ambos slots
+    const grid = leftSlot && leftSlot.parentElement;
+    if (!grid) return;
     const parent = grid.parentElement;
     if (!parent) return;
     if (parent.querySelector('.pinned-enhance-desc-row')) return;
 
     const row = document.createElement('div');
     row.className = 'pinned-enhance-desc-row';
-    row.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:6px;';
+    row.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px;padding:0;';
 
-    ['left', 'right'].forEach((slotKey) => {
+    ['left', 'right'].forEach(function(slotKey) {
       const desc = descriptionsCache[slotKey] || '';
       const hasPhoto = !!pinnedPhotoUrlsCache[slotKey];
       const cell = document.createElement('div');
-      cell.style.cssText = 'min-height:24px;padding:2px 2px;';
+      cell.style.cssText = 'min-height:24px;padding:2px 4px;cursor:pointer;';
 
       if (hasPhoto) {
         if (desc.trim()) {
-          cell.style.cssText += 'font-family:\'Fraunces\',serif;font-style:italic;font-size:12px;line-height:1.4;color:' + COLORS.inkSoft + ';';
+          cell.style.cssText += 'font-family:\'Fraunces\',serif;font-style:italic;font-size:13px;line-height:1.45;color:' + COLORS.inkSoft + ';';
           cell.textContent = desc;
         } else {
-          cell.style.cssText += 'font-family:\'Geist Mono\',monospace;font-size:9px;letter-spacing:0.15em;text-transform:uppercase;color:' + COLORS.inkSofter + ';opacity:0.6;';
-          cell.textContent = 'toca para describir';
+          cell.style.cssText += 'font-family:\'Geist Mono\',monospace;font-size:9px;letter-spacing:0.15em;text-transform:uppercase;color:' + COLORS.inkSofter + ';opacity:0.7;';
+          cell.textContent = '+ descripción';
         }
-        cell.style.cursor = 'pointer';
-        cell.addEventListener('click', () => openPhotoModal(slotKey));
+        cell.addEventListener('click', function() { openPhotoModal(slotKey); });
+      } else {
+        cell.textContent = '';
       }
       row.appendChild(cell);
     });
 
+    // Insertar después del grid
     if (grid.nextSibling) {
       parent.insertBefore(row, grid.nextSibling);
     } else {
@@ -387,28 +467,36 @@ lucide-react/dist/esm/lucide-react.js:
     }
   }
 
+  // ============================================================
+  // Procesar
+  // ============================================================
   let processing = false;
-  async function processPinnedGrid() {
+  async function processPinnedSlots() {
     if (processing) return;
     processing = true;
     try {
-      const grid = findPinnedGrid();
-      if (!grid) { processing = false; return; }
+      const slots = findPinnedSlots();
+      if (!slots) {
+        processing = false;
+        return;
+      }
       await loadPinnedItems();
-      enrichSlot(grid.children[0], 'left');
-      enrichSlot(grid.children[1], 'right');
-      addDescriptionRow(grid);
-      lastProcessedGrid = grid;
+      enrichSlot(slots.left, 'left', slots.hasPhoto && slots.hasPhoto.left);
+      enrichSlot(slots.right, 'right', slots.hasPhoto && slots.hasPhoto.right);
+      addDescriptionRow(slots.left, slots.right);
     } catch (e) {
-      console.error('[pinned-enhance]', e);
+      console.error('[pinned-enhance v3]', e);
     }
     processing = false;
   }
 
   function clearEnhancements() {
-    document.querySelectorAll('.pinned-enhance-tap-overlay, .pinned-enhance-delete, .pinned-enhance-desc-row').forEach(el => el.remove());
+    document.querySelectorAll('.pinned-enhance-tap-overlay, .pinned-enhance-delete, .pinned-enhance-desc-row').forEach(function(el) { el.remove(); });
   }
 
+  // ============================================================
+  // MODAL
+  // ============================================================
   function createModal() {
     if (modalEl) return modalEl;
     const m = document.createElement('div');
@@ -423,7 +511,7 @@ lucide-react/dist/esm/lucide-react.js:
         '<div style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;" id="pinned-modal-content"></div>' +
       '</div>';
     document.body.appendChild(m);
-    m.addEventListener('click', (e) => { if (e.target === m) closeModal(); });
+    m.addEventListener('click', function(e) { if (e.target === m) closeModal(); });
     m.querySelector('#pinned-modal-close').addEventListener('click', closeModal);
     modalEl = m;
     return m;
@@ -432,7 +520,7 @@ lucide-react/dist/esm/lucide-react.js:
   function openPhotoModal(slotKey) {
     const item = pinnedItemsCache[slotKey];
     const photoUrl = pinnedPhotoUrlsCache[slotKey];
-    currentSlotData = { item, slot: slotKey, photoUrl };
+    currentSlotData = { item: item, slot: slotKey, photoUrl: photoUrl };
     createModal().style.display = 'flex';
     renderModalContent();
   }
@@ -440,12 +528,14 @@ lucide-react/dist/esm/lucide-react.js:
   function closeModal() {
     if (modalEl) modalEl.style.display = 'none';
     currentSlotData = null;
-    setTimeout(() => { clearEnhancements(); processPinnedGrid(); }, 200);
+    setTimeout(function() { clearEnhancements(); processPinnedSlots(); }, 200);
   }
 
   async function renderModalContent() {
     if (!currentSlotData) return;
-    const { item, slot, photoUrl } = currentSlotData;
+    const item = currentSlotData.item;
+    const slot = currentSlotData.slot;
+    const photoUrl = currentSlotData.photoUrl;
     const content = modalEl.querySelector('#pinned-modal-content');
     modalEl.querySelector('#pinned-modal-title').textContent = slot === 'left' ? 'foto destacada · izquierda' : 'foto destacada · derecha';
     const description = (item && item.data && item.data.description) || descriptionsCache[slot] || '';
@@ -467,7 +557,7 @@ lucide-react/dist/esm/lucide-react.js:
         '<div id="pinned-tab-content"></div>' +
       '</div>';
 
-    content.querySelector('#pinned-desc-save').addEventListener('click', async () => {
+    content.querySelector('#pinned-desc-save').addEventListener('click', async function() {
       const desc = content.querySelector('#pinned-desc-input').value.trim();
       if (!item) { flashError('necesitas tener una foto primero'); return; }
       try {
@@ -479,8 +569,8 @@ lucide-react/dist/esm/lucide-react.js:
       }
     });
 
-    content.querySelector('#pinned-tab-comments').addEventListener('click', () => switchTab('comments'));
-    content.querySelector('#pinned-tab-history').addEventListener('click', () => switchTab('history'));
+    content.querySelector('#pinned-tab-comments').addEventListener('click', function() { switchTab('comments'); });
+    content.querySelector('#pinned-tab-history').addEventListener('click', function() { switchTab('history'); });
     switchTab('comments');
   }
 
@@ -543,24 +633,24 @@ lucide-react/dist/esm/lucide-react.js:
     '</div>';
     container.innerHTML = html;
 
-    container.querySelectorAll('.pinned-del-comment').forEach((btn) => {
-      btn.addEventListener('click', async () => {
+    container.querySelectorAll('.pinned-del-comment').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
         if (!confirm('¿borrar este comentario?')) return;
         try { await deleteComment(btn.getAttribute('data-id')); await renderComments(container); }
-        catch { flashError('no se pudo borrar'); }
+        catch (e) { flashError('no se pudo borrar'); }
       });
     });
 
-    container.querySelectorAll('.pinned-user-pick').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        try { localStorage.setItem('pajaritos_me', btn.getAttribute('data-user')); } catch {}
+    container.querySelectorAll('.pinned-user-pick').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        try { localStorage.setItem('pajaritos_me', btn.getAttribute('data-user')); } catch (e) {}
         renderComments(container);
       });
     });
 
     const sendBtn = container.querySelector('#pinned-comment-send');
     const input = container.querySelector('#pinned-comment-input');
-    sendBtn.addEventListener('click', async () => {
+    sendBtn.addEventListener('click', async function() {
       const text = input.value.trim();
       if (!text) return;
       const me2 = getCurrentUser();
@@ -568,7 +658,7 @@ lucide-react/dist/esm/lucide-react.js:
       try { await addComment(currentSlotData.slot, me2, text); input.value = ''; await renderComments(container); }
       catch (e) { flashError('no se pudo enviar: ' + e.message); }
     });
-    input.addEventListener('keydown', (e) => {
+    input.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendBtn.click(); }
     });
   }
@@ -607,7 +697,7 @@ lucide-react/dist/esm/lucide-react.js:
 
   function escapeHtml(s) {
     if (s == null) return '';
-    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    return String(s).replace(/[&<>"']/g, function(c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]); });
   }
 
   let flashEl = null;
@@ -621,34 +711,41 @@ lucide-react/dist/esm/lucide-react.js:
     flashEl.textContent = text;
     flashEl.style.opacity = '1';
     clearTimeout(flashEl._timer);
-    flashEl._timer = setTimeout(() => { flashEl.style.opacity = '0'; }, 2500);
+    flashEl._timer = setTimeout(function() { flashEl.style.opacity = '0'; }, 2500);
   }
   function flashError(text) { flashMessage('⚠ ' + text, COLORS.warning); }
   function flashSuccess(text) { flashMessage('✓ ' + text, COLORS.forest); }
 
+  // ============================================================
+  // INIT con polling agresivo
+  // ============================================================
   function init() {
-    processPinnedGrid();
-    const observer = new MutationObserver(() => {
-      const grid = findPinnedGrid();
-      if (!grid) return;
-      const need = (
-        (pinnedPhotoUrlsCache.left && !grid.children[0].querySelector('.pinned-enhance-tap-overlay')) ||
-        (pinnedPhotoUrlsCache.right && !grid.children[1].querySelector('.pinned-enhance-tap-overlay')) ||
-        !grid.parentElement.querySelector('.pinned-enhance-desc-row')
-      );
-      if (need) processPinnedGrid();
+    console.log('[pinned-enhance v3] init');
+    processPinnedSlots();
+
+    // MutationObserver
+    const observer = new MutationObserver(function() {
+      const slots = findPinnedSlots();
+      if (!slots) return;
+      const needsLeft = pinnedPhotoUrlsCache.left && !slots.left.querySelector('.pinned-enhance-tap-overlay');
+      const needsRight = pinnedPhotoUrlsCache.right && !slots.right.querySelector('.pinned-enhance-tap-overlay');
+      const needsDescRow = slots.left && slots.left.parentElement && !slots.left.parentElement.parentElement.querySelector('.pinned-enhance-desc-row');
+      if (needsLeft || needsRight || needsDescRow) {
+        processPinnedSlots();
+      }
     });
     observer.observe(document.body, { childList: true, subtree: true });
 
-    setInterval(() => {
-      const grid = findPinnedGrid();
-      if (grid && grid !== lastProcessedGrid) {
-        clearEnhancements();
-        processPinnedGrid();
+    // Polling cada 1.5 segundos por si el observer falla
+    setInterval(function() {
+      const slots = findPinnedSlots();
+      if (!slots) return;
+      const enhanced = document.querySelectorAll('.pinned-enhance-tap-overlay').length;
+      const expectEnhanced = (pinnedPhotoUrlsCache.left ? 1 : 0) + (pinnedPhotoUrlsCache.right ? 1 : 0);
+      if (enhanced < expectEnhanced) {
+        processPinnedSlots();
       }
-    }, 2500);
-
-    console.log('[pinned-enhance v2] initialized');
+    }, 1500);
   }
 
   let attempts = 0;
@@ -657,8 +754,8 @@ lucide-react/dist/esm/lucide-react.js:
     const root = document.getElementById('root');
     if (root && root.children.length > 0) {
       init();
-    } else if (attempts < 40) {
-      setTimeout(tryInit, 300);
+    } else if (attempts < 50) {
+      setTimeout(tryInit, 200);
     }
   }
   if (document.readyState === 'loading') {
