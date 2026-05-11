@@ -156,7 +156,7 @@ lucide-react/dist/esm/lucide-react.js:
 
 <script>
 /* ============================================================================
-   PAJARITOS PINNED ENHANCE v4 — banner de estado visible + detección robusta
+   PAJARITOS PINNED ENHANCE v5 — banner se oculta cuando ok, borrar robusto
    ============================================================================ */
 (function() {
   'use strict';
@@ -173,33 +173,89 @@ lucide-react/dist/esm/lucide-react.js:
   };
 
   // ============================================================
-  // BANNER DE ESTADO VISIBLE (siempre)
+  // BANNER (solo visible si hay error o está cargando)
   // ============================================================
   let statusBanner = null;
+  let hideBannerTimer = null;
   function createStatusBanner() {
     if (statusBanner) return statusBanner;
     const b = document.createElement('div');
     b.id = 'pinned-status';
-    b.style.cssText = 'position:fixed;bottom:calc(env(safe-area-inset-bottom) + 8px);left:8px;z-index:99999;padding:6px 10px;background:rgba(45,74,54,0.92);color:#fff;font-family:Menlo,Monaco,monospace;font-size:10px;letter-spacing:0.04em;border-radius:6px;max-width:260px;line-height:1.3;box-shadow:0 2px 8px rgba(0,0,0,0.2);';
-    b.textContent = 'v4 cargando…';
+    b.style.cssText = 'position:fixed;bottom:calc(env(safe-area-inset-bottom) + 8px);left:8px;z-index:99999;padding:6px 10px;background:rgba(45,74,54,0.92);color:#fff;font-family:Menlo,Monaco,monospace;font-size:10px;letter-spacing:0.04em;border-radius:6px;max-width:260px;line-height:1.3;box-shadow:0 2px 8px rgba(0,0,0,0.2);transition:opacity 0.3s;';
     if (document.body) document.body.appendChild(b);
     else document.addEventListener('DOMContentLoaded', function() { document.body.appendChild(b); });
     statusBanner = b;
     return b;
   }
-  function setStatus(text, color) {
+  function setStatus(text, color, autoHide) {
     const b = createStatusBanner();
-    b.textContent = 'v4 ' + text;
+    b.textContent = 'v5 ' + text;
+    b.style.opacity = '1';
+    b.style.display = 'block';
     if (color) b.style.background = color;
+    else b.style.background = 'rgba(45,74,54,0.92)';
+    if (hideBannerTimer) { clearTimeout(hideBannerTimer); hideBannerTimer = null; }
+    if (autoHide) {
+      hideBannerTimer = setTimeout(function() {
+        b.style.opacity = '0';
+        setTimeout(function() { b.style.display = 'none'; }, 350);
+      }, autoHide);
+    }
   }
-
-  setStatus('arrancando…');
 
   let pinnedItemsCache = { left: null, right: null };
   let pinnedPhotoUrlsCache = { left: null, right: null };
   let descriptionsCache = { left: '', right: '' };
+  let allPinnedItems = []; // todos los items pinned, para fallback
   let modalEl = null;
   let currentSlotData = null;
+
+  // ============================================================
+  // Helper: parsear data que puede venir como string
+  // ============================================================
+  function safeParseField(field) {
+    if (field == null) return null;
+    if (typeof field === 'object') return field;
+    if (typeof field === 'string') {
+      try { return JSON.parse(field); } catch (e) { return null; }
+    }
+    return null;
+  }
+
+  function getSlotFromItem(item) {
+    if (!item) return null;
+    // Tratar de varias formas
+    if (item.slot === 'left' || item.slot === 'right') return item.slot;
+    const data = safeParseField(item.data);
+    if (data && (data.slot === 'left' || data.slot === 'right')) return data.slot;
+    return null;
+  }
+
+  function getPhotoUrlFromItem(item) {
+    if (!item) return null;
+    // photos puede ser array, string JSON, u objeto
+    let photos = item.photos;
+    if (typeof photos === 'string') {
+      try { photos = JSON.parse(photos); } catch (e) { photos = []; }
+    }
+    if (!photos) {
+      const data = safeParseField(item.data);
+      photos = (data && data.photos) || [];
+    }
+    if (Array.isArray(photos) && photos.length > 0) {
+      const first = photos[0];
+      if (typeof first === 'string') return first;
+      if (first && first.url) return first.url;
+      if (first && first.dataUrl) return first.dataUrl;
+    }
+    return null;
+  }
+
+  function getDescriptionFromItem(item) {
+    if (!item) return '';
+    const data = safeParseField(item.data);
+    return (data && data.description) || '';
+  }
 
   // ============================================================
   // Supabase
@@ -231,37 +287,66 @@ lucide-react/dist/esm/lucide-react.js:
     return null;
   }
 
-  function getPhotoUrlFromItem(item) {
-    if (!item) return null;
-    const photos = item.photos || (item.data && item.data.photos) || [];
-    if (Array.isArray(photos) && photos.length > 0) {
-      const first = photos[0];
-      if (typeof first === 'string') return first;
-      if (first && first.url) return first.url;
-      if (first && first.dataUrl) return first.dataUrl;
-    }
-    return null;
-  }
-
   async function loadPinnedItems() {
     try {
       const items = await sbFetch('items?type=eq.pinned&order=created_at.desc');
       const arr = items || [];
-      const left = arr.find(function(i) { return (i.data && i.data.slot === 'left') || i.slot === 'left'; }) || null;
-      const right = arr.find(function(i) { return (i.data && i.data.slot === 'right') || i.slot === 'right'; }) || null;
+      allPinnedItems = arr;
+
+      // Intentar matchear por slot
+      let left = null, right = null;
+      for (const item of arr) {
+        const slot = getSlotFromItem(item);
+        if (slot === 'left' && !left) left = item;
+        else if (slot === 'right' && !right) right = item;
+      }
+
       pinnedItemsCache = { left: left, right: right };
       pinnedPhotoUrlsCache = {
         left: getPhotoUrlFromItem(left),
         right: getPhotoUrlFromItem(right),
       };
       descriptionsCache = {
-        left: (left && left.data && left.data.description) || '',
-        right: (right && right.data && right.data.description) || '',
+        left: getDescriptionFromItem(left),
+        right: getDescriptionFromItem(right),
       };
       return true;
     } catch (e) {
       setStatus('supabase err: ' + e.message.substring(0, 30), 'rgba(160,74,44,0.92)');
       return false;
+    }
+  }
+
+  // Fallback: si el script encuentra una foto en DOM pero no matcheó por slot,
+  // asignar el item más reciente al slot correspondiente
+  function applyFallbackMatching(slots) {
+    if (!slots) return;
+    const leftSlot = slots.left;
+    const rightSlot = slots.right;
+    const leftHasPhotoDOM = slots.leftHasPhoto;
+    const rightHasPhotoDOM = slots.rightHasPhoto;
+
+    // Si DOM dice que hay foto pero no se matcheó item, buscar entre todos
+    if (leftHasPhotoDOM && !pinnedItemsCache.left && allPinnedItems.length > 0) {
+      // Tomar el primero que no sea ya el right
+      for (const item of allPinnedItems) {
+        if (item !== pinnedItemsCache.right) {
+          pinnedItemsCache.left = item;
+          pinnedPhotoUrlsCache.left = getPhotoUrlFromItem(item);
+          descriptionsCache.left = getDescriptionFromItem(item);
+          break;
+        }
+      }
+    }
+    if (rightHasPhotoDOM && !pinnedItemsCache.right && allPinnedItems.length > 0) {
+      for (const item of allPinnedItems) {
+        if (item !== pinnedItemsCache.left) {
+          pinnedItemsCache.right = item;
+          pinnedPhotoUrlsCache.right = getPhotoUrlFromItem(item);
+          descriptionsCache.right = getDescriptionFromItem(item);
+          break;
+        }
+      }
     }
   }
 
@@ -295,17 +380,17 @@ lucide-react/dist/esm/lucide-react.js:
     return sbFetch('items?id=eq.' + itemId, { method: 'DELETE' });
   }
 
-  async function archiveToHistory(item, photoUrl) {
+  async function archiveToHistory(item, photoUrl, slotKey) {
     if (!item || !photoUrl) return;
-    const slotKey = (item.data && item.data.slot) || item.slot;
     const slotNum = slotKey === 'left' ? 1 : 2;
-    const by = item.by_user || item.by || 'adrian';
+    const data = safeParseField(item.data) || {};
+    const by = item.by_user || item.by || data.by || 'adrian';
     return sbFetch('pinned_history', {
       method: 'POST',
       body: JSON.stringify({
         pinned_slot: slotNum,
         photo_url: photoUrl,
-        description: (item.data && item.data.description) || null,
+        description: data.description || null,
         uploaded_by: by,
         replaced_at: new Date().toISOString(),
       }),
@@ -313,7 +398,8 @@ lucide-react/dist/esm/lucide-react.js:
   }
 
   async function updateItemDescription(itemId, description, currentData) {
-    const newData = Object.assign({}, currentData || {}, { description: description || '' });
+    const data = safeParseField(currentData) || {};
+    const newData = Object.assign({}, data, { description: description || '' });
     return sbFetch('items?id=eq.' + itemId, {
       method: 'PATCH',
       body: JSON.stringify({ data: newData }),
@@ -321,12 +407,10 @@ lucide-react/dist/esm/lucide-react.js:
   }
 
   // ============================================================
-  // DETECCIÓN — múltiples estrategias
+  // Detección
   // ============================================================
   function findPinnedSlots() {
     const candidates = [];
-
-    // Estrategia 1: botones que CONTENGAN "cambiar" en su texto
     const allButtons = document.querySelectorAll('button');
     for (let i = 0; i < allButtons.length; i++) {
       const btn = allButtons[i];
@@ -345,8 +429,6 @@ lucide-react/dist/esm/lucide-react.js:
         }
       }
     }
-
-    // Estrategia 2: spans/elementos que digan "+ foto" o "subiendo" o "+foto"
     const allElems = document.querySelectorAll('span, button, div');
     for (let i = 0; i < allElems.length; i++) {
       const el = allElems[i];
@@ -368,8 +450,6 @@ lucide-react/dist/esm/lucide-react.js:
     }
 
     if (candidates.length < 2) return null;
-
-    // Ordenar por posición horizontal (izq → der)
     candidates.sort(function(a, b) {
       return a.el.getBoundingClientRect().left - b.el.getBoundingClientRect().left;
     });
@@ -383,19 +463,16 @@ lucide-react/dist/esm/lucide-react.js:
   }
 
   // ============================================================
-  // Enriquecer slot (botón borrar grande visible)
+  // Enriquecer slot
   // ============================================================
   function enrichSlot(slotEl, slotKey, hasPhotoInDOM) {
     if (!slotEl) return false;
     if (slotEl.querySelector('.pinned-enhance-tap-overlay')) return true;
-    if (!hasPhotoInDOM) return false; // solo si hay foto
+    if (!hasPhotoInDOM) return false;
 
-    // Forzar position relative (con !important via setProperty)
     slotEl.style.setProperty('position', 'relative', 'important');
-
     slotEl.setAttribute('data-pinned-slot', slotKey);
 
-    // Tap overlay para abrir modal (no cubre el botón "cambiar" en la esquina inferior derecha)
     const tapOverlay = document.createElement('button');
     tapOverlay.className = 'pinned-enhance-tap-overlay';
     tapOverlay.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:calc(100% - 48px);background:transparent;border:none;cursor:pointer;z-index:5;padding:0;margin:0;';
@@ -406,7 +483,6 @@ lucide-react/dist/esm/lucide-react.js:
     });
     slotEl.appendChild(tapOverlay);
 
-    // Botón BORRAR grande y visible (rojo) en esquina superior izquierda
     const delBtn = document.createElement('button');
     delBtn.className = 'pinned-enhance-delete';
     delBtn.innerHTML = '<span style="font-size:14px;line-height:1;">×</span><span style="font-family:\'Geist Mono\',Menlo,monospace;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;margin-left:4px;">borrar</span>';
@@ -415,14 +491,33 @@ lucide-react/dist/esm/lucide-react.js:
       e.preventDefault();
       e.stopPropagation();
       if (!confirm('¿borrar esta foto? se guardará en el historial')) return;
-      const item = pinnedItemsCache[slotKey];
-      const url = pinnedPhotoUrlsCache[slotKey];
+
+      // Fallback robusto: buscar el item para borrar
+      let item = pinnedItemsCache[slotKey];
+      let url = pinnedPhotoUrlsCache[slotKey];
+
+      // Si no hay item cached, recargar y aplicar fallback
       if (!item) {
-        flashError('no se encontró en la base de datos');
+        await loadPinnedItems();
+        const slots = findPinnedSlots();
+        applyFallbackMatching(slots);
+        item = pinnedItemsCache[slotKey];
+        url = pinnedPhotoUrlsCache[slotKey];
+      }
+
+      // Si todavía no, y hay items pinned en general, usar el primero
+      if (!item && allPinnedItems.length > 0) {
+        item = allPinnedItems[0];
+        url = getPhotoUrlFromItem(item);
+      }
+
+      if (!item) {
+        flashError('no se encontró ningún pinned para borrar');
         return;
       }
+
       try {
-        await archiveToHistory(item, url);
+        await archiveToHistory(item, url, slotKey);
         await deletePinnedItem(item.id);
         flashSuccess('foto borrada, refrescando…');
         setTimeout(function() { location.reload(); }, 900);
@@ -435,9 +530,6 @@ lucide-react/dist/esm/lucide-react.js:
     return true;
   }
 
-  // ============================================================
-  // Fila de descripciones debajo del grid
-  // ============================================================
   function addDescriptionRow(leftSlot, rightSlot) {
     const grid = leftSlot && leftSlot.parentElement;
     if (!grid) return false;
@@ -451,12 +543,12 @@ lucide-react/dist/esm/lucide-react.js:
 
     ['left', 'right'].forEach(function(slotKey) {
       const desc = descriptionsCache[slotKey] || '';
-      const hasPhoto = !!pinnedPhotoUrlsCache[slotKey];
+      const hasPhoto = !!pinnedPhotoUrlsCache[slotKey] || (slotKey === 'left' ? leftSlot : rightSlot).querySelector('img');
       const cell = document.createElement('div');
 
       if (hasPhoto) {
         cell.style.cssText = 'min-height:24px;padding:6px 4px;cursor:pointer;';
-        if (desc.trim()) {
+        if (desc && desc.trim()) {
           cell.style.cssText += 'font-family:\'Fraunces\',Georgia,serif;font-style:italic;font-size:13px;line-height:1.45;color:' + COLORS.inkSoft + ';';
           cell.textContent = desc;
         } else {
@@ -479,9 +571,6 @@ lucide-react/dist/esm/lucide-react.js:
     return true;
   }
 
-  // ============================================================
-  // Procesar
-  // ============================================================
   let processing = false;
   async function processPinnedSlots() {
     if (processing) return;
@@ -489,20 +578,30 @@ lucide-react/dist/esm/lucide-react.js:
     try {
       const slots = findPinnedSlots();
       if (!slots) {
-        setStatus('buscando fotos pinned… (no detectadas aún)');
         processing = false;
         return;
       }
-      setStatus('slots encontrados: 2');
       const loaded = await loadPinnedItems();
       if (!loaded) { processing = false; return; }
+
+      // Aplicar fallback matching DESPUÉS de cargar
+      applyFallbackMatching(slots);
 
       let enrichedCount = 0;
       if (enrichSlot(slots.left, 'left', slots.leftHasPhoto)) enrichedCount++;
       if (enrichSlot(slots.right, 'right', slots.rightHasPhoto)) enrichedCount++;
       addDescriptionRow(slots.left, slots.right);
 
-      setStatus('listo · fotos: ' + enrichedCount + '/2');
+      const expectEnhanced = (slots.leftHasPhoto ? 1 : 0) + (slots.rightHasPhoto ? 1 : 0);
+      if (enrichedCount === expectEnhanced && enrichedCount > 0) {
+        // Todo OK — ocultar banner después de 1.5s
+        setStatus('listo · ' + enrichedCount + ' foto' + (enrichedCount !== 1 ? 's' : ''), null, 1500);
+      } else if (enrichedCount === 0 && expectEnhanced === 0) {
+        // No hay fotos, sin necesidad de mensaje
+        setStatus('listo · sin fotos', null, 1000);
+      } else {
+        setStatus('parcial · ' + enrichedCount + '/' + expectEnhanced);
+      }
     } catch (e) {
       setStatus('err: ' + e.message.substring(0, 40), 'rgba(160,74,44,0.92)');
     }
@@ -557,7 +656,7 @@ lucide-react/dist/esm/lucide-react.js:
     const photoUrl = currentSlotData.photoUrl;
     const content = modalEl.querySelector('#pinned-modal-content');
     modalEl.querySelector('#pinned-modal-title').textContent = slot === 'left' ? 'foto destacada · izquierda' : 'foto destacada · derecha';
-    const description = (item && item.data && item.data.description) || descriptionsCache[slot] || '';
+    const description = (item && getDescriptionFromItem(item)) || descriptionsCache[slot] || '';
 
     content.innerHTML =
       '<div style="background:' + COLORS.paper + ';">' +
@@ -578,9 +677,17 @@ lucide-react/dist/esm/lucide-react.js:
 
     content.querySelector('#pinned-desc-save').addEventListener('click', async function() {
       const desc = content.querySelector('#pinned-desc-input').value.trim();
-      if (!item) { flashError('necesitas una foto primero'); return; }
+      let useItem = item;
+      if (!useItem) {
+        // fallback: recargar y matchear
+        await loadPinnedItems();
+        const slots = findPinnedSlots();
+        applyFallbackMatching(slots);
+        useItem = pinnedItemsCache[slot];
+      }
+      if (!useItem) { flashError('no se encontró foto en la base de datos'); return; }
       try {
-        await updateItemDescription(item.id, desc, item.data);
+        await updateItemDescription(useItem.id, desc, useItem.data);
         descriptionsCache[slot] = desc;
         flashSuccess('descripción guardada');
       } catch (e) {
@@ -736,10 +843,9 @@ lucide-react/dist/esm/lucide-react.js:
   function flashSuccess(text) { flashMessage('✓ ' + text, COLORS.forest); }
 
   // ============================================================
-  // INIT
+  // INIT — no muestra banner si no hay slots (pantalla de login)
   // ============================================================
   function init() {
-    setStatus('react montado, buscando…');
     processPinnedSlots();
 
     const observer = new MutationObserver(function() {
@@ -768,14 +874,11 @@ lucide-react/dist/esm/lucide-react.js:
   let attempts = 0;
   function tryInit() {
     attempts++;
-    setStatus('init #' + attempts);
     const root = document.getElementById('root');
     if (root && root.children.length > 0) {
       init();
     } else if (attempts < 60) {
       setTimeout(tryInit, 250);
-    } else {
-      setStatus('react no montó tras 60 intentos', 'rgba(160,74,44,0.92)');
     }
   }
 
