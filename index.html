@@ -153,5 +153,663 @@ lucide-react/dist/esm/lucide-react.js:
 */
 
 </script>
+
+<script>
+/* ============================================================================
+   PAJARITOS PINNED ENHANCE — features extras para las fotos pinned
+   - Borrar foto
+   - Descripción cortita debajo
+   - Tap en foto → modal grande con comentarios + historial
+   ============================================================================ */
+(function() {
+  'use strict';
+
+  const SUPABASE_URL = 'https://prciyaxwmyhxyfuwyynl.supabase.co';
+  const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InByY2l5YXh3bXloeHlmdXd5eW5sIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcyMjcyOTQsImV4cCI6MjA5MjgwMzI5NH0.jZePtNzk7we56odUJndm1TWdwnMbZPs94N7pFdRrulk';
+
+  const COLORS = {
+    bg: '#F4F2ED',
+    paper: '#FFFFFF',
+    ink: '#0E0E0C',
+    inkSoft: '#4A4A48',
+    inkSofter: '#A8A29E',
+    ochre: '#B07A3E',
+    forest: '#2D4A36',
+    warning: '#A04A2C',
+    rule: '#E8E4DA',
+    bubbleVale: '#FAF1E5',
+    bubbleAdrian: '#EEF2EE',
+  };
+
+  // ============================================================
+  // Supabase REST helpers
+  // ============================================================
+  async function sbFetch(path, options = {}) {
+    const url = `${SUPABASE_URL}/rest/v1/${path}`;
+    const res = await fetch(url, {
+      ...options,
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation',
+        ...(options.headers || {}),
+      },
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Supabase ${res.status}: ${errText}`);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  }
+
+  // ============================================================
+  // Detectar usuario actual
+  // ============================================================
+  function getCurrentUser() {
+    // Buscar en localStorage o en el DOM (chips de avatar arriba)
+    try {
+      const stored = localStorage.getItem('pajaritos_me');
+      if (stored && (stored === 'vale' || stored === 'adrian')) return stored;
+    } catch {}
+    // Fallback: buscar avatar activo en DOM
+    const avatar = document.querySelector('[data-active-user]');
+    if (avatar) return avatar.getAttribute('data-active-user');
+    return null;
+  }
+
+  // ============================================================
+  // Detectar fotos pinned en el DOM
+  // ============================================================
+  function findPinnedSlots() {
+    // Buscar grid de 2 columnas que tenga botones "+ FOTO" o imágenes pinned
+    const grids = document.querySelectorAll('.grid.grid-cols-2.gap-3');
+    for (const grid of grids) {
+      if (grid.children.length === 2) {
+        const text = grid.textContent || '';
+        const hasFotoText = text.includes('+ FOTO') || text.includes('FOTO');
+        const hasImage = grid.querySelectorAll('img').length > 0;
+        if (hasFotoText || hasImage) {
+          return {
+            container: grid,
+            left: grid.children[0],
+            right: grid.children[1],
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  // ============================================================
+  // Cargar fotos pinned actuales desde Supabase
+  // ============================================================
+  async function loadPinnedItems() {
+    try {
+      const items = await sbFetch('items?type=eq.pinned&order=created_at.desc');
+      return items || [];
+    } catch (e) {
+      console.error('[pinned-enhance] load failed:', e);
+      return [];
+    }
+  }
+
+  async function loadComments(pinnedSlot) {
+    try {
+      const slotNum = pinnedSlot === 'left' ? 1 : 2;
+      const items = await sbFetch(`pinned_comments?pinned_slot=eq.${slotNum}&order=created_at.asc`);
+      return items || [];
+    } catch (e) {
+      console.error('[pinned-enhance] load comments failed:', e);
+      return [];
+    }
+  }
+
+  async function loadHistory(pinnedSlot) {
+    try {
+      const slotNum = pinnedSlot === 'left' ? 1 : 2;
+      const items = await sbFetch(`pinned_history?pinned_slot=eq.${slotNum}&order=uploaded_at.desc`);
+      return items || [];
+    } catch (e) {
+      console.error('[pinned-enhance] load history failed:', e);
+      return [];
+    }
+  }
+
+  async function addComment(pinnedSlot, by, text) {
+    const slotNum = pinnedSlot === 'left' ? 1 : 2;
+    return sbFetch('pinned_comments', {
+      method: 'POST',
+      body: JSON.stringify({
+        pinned_slot: slotNum,
+        by: by,
+        text: text,
+      }),
+    });
+  }
+
+  async function deleteComment(commentId) {
+    return sbFetch(`pinned_comments?id=eq.${commentId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async function deletePinnedItem(itemId) {
+    return sbFetch(`items?id=eq.${itemId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async function archiveToHistory(item, photoUrl) {
+    if (!item || !photoUrl) return;
+    const slotNum = item.slot === 'left' ? 1 : 2;
+    return sbFetch('pinned_history', {
+      method: 'POST',
+      body: JSON.stringify({
+        pinned_slot: slotNum,
+        photo_url: photoUrl,
+        description: (item.data && item.data.description) || null,
+        uploaded_by: item.by_user || item.by || 'adrian',
+        replaced_at: new Date().toISOString(),
+      }),
+    });
+  }
+
+  async function updateDescription(itemId, description) {
+    return sbFetch(`items?id=eq.${itemId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        data: { description: description || '' },
+      }),
+    });
+  }
+
+  // ============================================================
+  // UI — Modal global
+  // ============================================================
+  let modalEl = null;
+  let currentSlotData = null;
+
+  function createModal() {
+    if (modalEl) return modalEl;
+    const m = document.createElement('div');
+    m.id = 'pinned-modal';
+    m.style.cssText = `
+      position: fixed; inset: 0; z-index: 9999;
+      background: rgba(14,14,12,0.78); backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      display: none; align-items: flex-end; justify-content: center;
+      animation: pinnedFadeIn 0.18s ease-out;
+    `;
+    m.innerHTML = `
+      <style>
+        @keyframes pinnedFadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes pinnedSlideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        #pinned-modal .panel { animation: pinnedSlideUp 0.22s ease-out; }
+        #pinned-modal *, #pinned-modal *::before, #pinned-modal *::after {
+          -webkit-tap-highlight-color: transparent;
+          box-sizing: border-box;
+        }
+        #pinned-modal input, #pinned-modal textarea { font-size: 16px !important; }
+        #pinned-modal .tab-active { border-bottom: 2px solid ${COLORS.ink}; color: ${COLORS.ink}; }
+        #pinned-modal .tab-inactive { color: ${COLORS.inkSofter}; }
+        #pinned-modal button:active { opacity: 0.65; }
+      </style>
+      <div class="panel" style="
+        background: ${COLORS.bg};
+        width: 100%; max-width: 560px;
+        max-height: 92vh; max-height: 92dvh;
+        display: flex; flex-direction: column;
+        border-radius: 18px 18px 0 0;
+        overflow: hidden;
+      ">
+        <div style="padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid ${COLORS.rule}; background: ${COLORS.paper};">
+          <div style="font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: ${COLORS.inkSoft};" id="pinned-modal-title">foto destacada</div>
+          <button id="pinned-modal-close" style="background: none; border: none; cursor: pointer; padding: 6px; color: ${COLORS.inkSoft}; font-size: 22px; line-height: 1;">×</button>
+        </div>
+        <div style="flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;" id="pinned-modal-content">
+          <!-- contenido dinámico -->
+        </div>
+      </div>
+    `;
+    document.body.appendChild(m);
+    m.addEventListener('click', (e) => {
+      if (e.target === m) closeModal();
+    });
+    m.querySelector('#pinned-modal-close').addEventListener('click', closeModal);
+    modalEl = m;
+    return m;
+  }
+
+  function openModal(slotData) {
+    currentSlotData = slotData;
+    const m = createModal();
+    m.style.display = 'flex';
+    renderModalContent();
+  }
+
+  function closeModal() {
+    if (modalEl) modalEl.style.display = 'none';
+    currentSlotData = null;
+  }
+
+  async function renderModalContent() {
+    if (!currentSlotData) return;
+    const { item, slot, photoUrl } = currentSlotData;
+    const content = modalEl.querySelector('#pinned-modal-content');
+    const titleEl = modalEl.querySelector('#pinned-modal-title');
+    titleEl.textContent = slot === 'left' ? 'foto destacada · izquierda' : 'foto destacada · derecha';
+    const me = getCurrentUser();
+    const description = (item && item.data && item.data.description) || '';
+
+    content.innerHTML = `
+      <div style="background: ${COLORS.paper};">
+        ${photoUrl ? `
+          <div style="background: #000; max-height: 50vh; display: flex; align-items: center; justify-content: center;">
+            <img src="${photoUrl}" style="width: 100%; max-height: 50vh; object-fit: contain;" />
+          </div>
+        ` : `
+          <div style="background: ${COLORS.bg}; padding: 60px 20px; text-align: center; color: ${COLORS.inkSofter}; font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.15em; text-transform: uppercase;">
+            todavía no hay foto en este espacio
+          </div>
+        `}
+        <div style="padding: 18px;">
+          <div style="font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: ${COLORS.inkSofter}; margin-bottom: 8px;">descripción</div>
+          <textarea id="pinned-desc-input" placeholder="agrega una descripción cortita…" style="
+            width: 100%; min-height: 56px; resize: none;
+            background: ${COLORS.bg}; border: 1px solid ${COLORS.rule};
+            padding: 10px 12px; font-family: 'Fraunces', serif; font-style: italic;
+            font-size: 15px; line-height: 1.45; color: ${COLORS.ink};
+            outline: none;
+          ">${escapeHtml(description)}</textarea>
+          <button id="pinned-desc-save" style="
+            margin-top: 8px; padding: 8px 14px;
+            background: ${COLORS.ink}; color: #fff; border: none;
+            font-family: 'Geist Mono', monospace; font-size: 10px;
+            letter-spacing: 0.18em; text-transform: uppercase;
+            cursor: pointer;
+          ">guardar descripción</button>
+          ${item ? `
+            <button id="pinned-delete-photo" style="
+              margin-top: 8px; margin-left: 8px; padding: 8px 14px;
+              background: ${COLORS.warning}; color: #fff; border: none;
+              font-family: 'Geist Mono', monospace; font-size: 10px;
+              letter-spacing: 0.18em; text-transform: uppercase;
+              cursor: pointer;
+            ">borrar esta foto</button>
+          ` : ''}
+        </div>
+      </div>
+
+      <div style="background: ${COLORS.bg}; padding: 18px; border-top: 1px solid ${COLORS.rule};">
+        <div style="display: flex; gap: 0; border-bottom: 1px solid ${COLORS.rule}; margin-bottom: 14px;">
+          <button id="pinned-tab-comments" class="tab-active" style="
+            flex: 1; padding: 10px; background: none; border: none; cursor: pointer;
+            font-family: 'Geist Mono', monospace; font-size: 10px;
+            letter-spacing: 0.18em; text-transform: uppercase;
+          ">comentarios</button>
+          <button id="pinned-tab-history" class="tab-inactive" style="
+            flex: 1; padding: 10px; background: none; border: none; cursor: pointer;
+            font-family: 'Geist Mono', monospace; font-size: 10px;
+            letter-spacing: 0.18em; text-transform: uppercase;
+          ">historial</button>
+        </div>
+        <div id="pinned-tab-content">
+          <div style="text-align: center; padding: 20px; color: ${COLORS.inkSofter}; font-size: 12px;">cargando…</div>
+        </div>
+      </div>
+    `;
+
+    // Listeners
+    content.querySelector('#pinned-desc-save').addEventListener('click', async () => {
+      const desc = content.querySelector('#pinned-desc-input').value.trim();
+      if (!item) {
+        flashError('necesitas tener una foto antes de guardar descripción');
+        return;
+      }
+      try {
+        await updateDescription(item.id, desc);
+        flashSuccess('descripción guardada');
+      } catch (e) {
+        flashError('no se pudo guardar: ' + e.message);
+      }
+    });
+
+    const delBtn = content.querySelector('#pinned-delete-photo');
+    if (delBtn) {
+      delBtn.addEventListener('click', async () => {
+        if (!confirm('¿borrar esta foto? se guardará en el historial')) return;
+        try {
+          await archiveToHistory(item, photoUrl);
+          await deletePinnedItem(item.id);
+          flashSuccess('foto borrada — refresca para ver el cambio');
+          setTimeout(closeModal, 1200);
+        } catch (e) {
+          flashError('no se pudo borrar: ' + e.message);
+        }
+      });
+    }
+
+    // Tabs
+    content.querySelector('#pinned-tab-comments').addEventListener('click', () => switchTab('comments'));
+    content.querySelector('#pinned-tab-history').addEventListener('click', () => switchTab('history'));
+
+    // Cargar comentarios por defecto
+    switchTab('comments');
+  }
+
+  async function switchTab(which) {
+    const tabComments = modalEl.querySelector('#pinned-tab-comments');
+    const tabHistory = modalEl.querySelector('#pinned-tab-history');
+    const tabContent = modalEl.querySelector('#pinned-tab-content');
+    if (which === 'comments') {
+      tabComments.className = 'tab-active';
+      tabHistory.className = 'tab-inactive';
+      await renderComments(tabContent);
+    } else {
+      tabComments.className = 'tab-inactive';
+      tabHistory.className = 'tab-active';
+      await renderHistory(tabContent);
+    }
+  }
+
+  async function renderComments(container) {
+    container.innerHTML = `<div style="text-align: center; padding: 20px; color: ${COLORS.inkSofter}; font-size: 12px;">cargando comentarios…</div>`;
+    const slot = currentSlotData.slot;
+    const me = getCurrentUser();
+    let comments = [];
+    try {
+      comments = await loadComments(slot);
+    } catch (e) {
+      container.innerHTML = `<div style="text-align: center; padding: 20px; color: ${COLORS.warning}; font-size: 12px;">error cargando: ${escapeHtml(e.message)}</div>`;
+      return;
+    }
+
+    let html = '';
+    if (comments.length === 0) {
+      html += `<div style="text-align: center; padding: 16px; color: ${COLORS.inkSofter}; font-family: 'Fraunces', serif; font-style: italic; font-size: 14px;">aún no hay comentarios</div>`;
+    } else {
+      html += '<div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px;">';
+      for (const c of comments) {
+        const isMine = c.by === me;
+        const bubbleColor = c.by === 'vale' ? COLORS.bubbleVale : COLORS.bubbleAdrian;
+        const labelColor = c.by === 'vale' ? COLORS.ochre : COLORS.forest;
+        const date = new Date(c.created_at);
+        const timeStr = date.toLocaleString('es-MX', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+        html += `
+          <div style="display: flex; ${isMine ? 'justify-content: flex-end;' : ''}; gap: 8px;">
+            <div style="max-width: 78%; padding: 10px 12px; background: ${bubbleColor}; border: 1px solid ${labelColor}33;">
+              <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px;">
+                <span style="font-family: 'Geist Mono', monospace; font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: ${labelColor};">${c.by === 'vale' ? 'vale' : 'adrián'}</span>
+                <span style="font-family: 'Geist Mono', monospace; font-size: 9px; color: ${COLORS.inkSofter};">${escapeHtml(timeStr)}</span>
+              </div>
+              <div style="font-family: 'Fraunces', serif; font-size: 14px; line-height: 1.5; color: ${COLORS.ink}; white-space: pre-wrap;">${escapeHtml(c.text)}</div>
+              ${isMine ? `<button class="pinned-del-comment" data-id="${c.id}" style="margin-top: 6px; background: none; border: none; cursor: pointer; font-family: 'Geist Mono', monospace; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: ${COLORS.inkSofter}; padding: 0;">borrar</button>` : ''}
+            </div>
+          </div>
+        `;
+      }
+      html += '</div>';
+    }
+    html += `
+      <div style="display: flex; gap: 8px; align-items: flex-end;">
+        <textarea id="pinned-comment-input" placeholder="escribe un comentario…" style="
+          flex: 1; min-height: 40px; max-height: 100px; resize: none;
+          background: ${COLORS.paper}; border: 1px solid ${COLORS.rule};
+          padding: 9px 12px; font-family: 'Fraunces', serif;
+          font-size: 14px; line-height: 1.4; color: ${COLORS.ink};
+          outline: none;
+        "></textarea>
+        <button id="pinned-comment-send" style="
+          padding: 10px 14px; background: ${COLORS.ink}; color: #fff;
+          border: none; cursor: pointer;
+          font-family: 'Geist Mono', monospace; font-size: 10px;
+          letter-spacing: 0.16em; text-transform: uppercase;
+        ">enviar</button>
+      </div>
+    `;
+    container.innerHTML = html;
+
+    container.querySelectorAll('.pinned-del-comment').forEach((btn) => {
+      btn.addEventListener('click', async (e) => {
+        const id = btn.getAttribute('data-id');
+        if (!confirm('¿borrar este comentario?')) return;
+        try {
+          await deleteComment(id);
+          await renderComments(container);
+        } catch (err) {
+          flashError('no se pudo borrar');
+        }
+      });
+    });
+
+    const sendBtn = container.querySelector('#pinned-comment-send');
+    const input = container.querySelector('#pinned-comment-input');
+    sendBtn.addEventListener('click', async () => {
+      const text = input.value.trim();
+      if (!text) return;
+      if (!me) { flashError('no detecto qué usuario eres'); return; }
+      try {
+        await addComment(currentSlotData.slot, me, text);
+        input.value = '';
+        await renderComments(container);
+      } catch (e) {
+        flashError('no se pudo enviar: ' + e.message);
+      }
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendBtn.click();
+      }
+    });
+  }
+
+  async function renderHistory(container) {
+    container.innerHTML = `<div style="text-align: center; padding: 20px; color: ${COLORS.inkSofter}; font-size: 12px;">cargando historial…</div>`;
+    const slot = currentSlotData.slot;
+    let history = [];
+    try {
+      history = await loadHistory(slot);
+    } catch (e) {
+      container.innerHTML = `<div style="text-align: center; padding: 20px; color: ${COLORS.warning}; font-size: 12px;">error: ${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    if (history.length === 0) {
+      container.innerHTML = `<div style="text-align: center; padding: 16px; color: ${COLORS.inkSofter}; font-family: 'Fraunces', serif; font-style: italic; font-size: 14px;">todavía no hay historial — cuando reemplaces una foto, la anterior aparecerá aquí</div>`;
+      return;
+    }
+    let html = '<div style="display: flex; flex-direction: column; gap: 14px;">';
+    for (const h of history) {
+      const date = new Date(h.uploaded_at || h.replaced_at);
+      const timeStr = date.toLocaleDateString('es-MX', { day: 'numeric', month: 'short', year: 'numeric' });
+      const labelColor = h.uploaded_by === 'vale' ? COLORS.ochre : COLORS.forest;
+      html += `
+        <div style="background: ${COLORS.paper}; border: 1px solid ${COLORS.rule}; overflow: hidden;">
+          <img src="${escapeHtml(h.photo_url)}" style="width: 100%; max-height: 280px; object-fit: cover; display: block;" />
+          <div style="padding: 10px 12px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+              <span style="font-family: 'Geist Mono', monospace; font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: ${labelColor};">${h.uploaded_by === 'vale' ? 'vale' : 'adrián'}</span>
+              <span style="font-family: 'Geist Mono', monospace; font-size: 9px; color: ${COLORS.inkSofter};">${escapeHtml(timeStr)}</span>
+            </div>
+            ${h.description ? `<div style="font-family: 'Fraunces', serif; font-style: italic; font-size: 13px; line-height: 1.4; color: ${COLORS.inkSoft};">${escapeHtml(h.description)}</div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  }
+
+  // ============================================================
+  // Helpers UI
+  // ============================================================
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  let flashEl = null;
+  function flashMessage(text, color) {
+    if (!flashEl) {
+      flashEl = document.createElement('div');
+      flashEl.style.cssText = `
+        position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+        z-index: 10001; padding: 10px 18px; max-width: 92%;
+        font-family: 'Geist Mono', monospace; font-size: 11px;
+        letter-spacing: 0.06em; color: #fff;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+        opacity: 0; transition: opacity 0.2s;
+      `;
+      document.body.appendChild(flashEl);
+    }
+    flashEl.style.background = color;
+    flashEl.textContent = text;
+    flashEl.style.opacity = '1';
+    clearTimeout(flashEl._timer);
+    flashEl._timer = setTimeout(() => { flashEl.style.opacity = '0'; }, 2500);
+  }
+  function flashError(text) { flashMessage('⚠ ' + text, COLORS.warning); }
+  function flashSuccess(text) { flashMessage('✓ ' + text, COLORS.forest); }
+
+  // ============================================================
+  // Botón flotante de acceso a fotos pinned
+  // ============================================================
+  function createFloatingButton() {
+    if (document.getElementById('pinned-fab')) return;
+    const btn = document.createElement('button');
+    btn.id = 'pinned-fab';
+    btn.title = 'gestionar fotos destacadas';
+    btn.innerHTML = `
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="7" height="7"/>
+        <rect x="14" y="3" width="7" height="7"/>
+        <rect x="3" y="14" width="7" height="7"/>
+        <rect x="14" y="14" width="7" height="7"/>
+      </svg>
+    `;
+    btn.style.cssText = `
+      position: fixed; bottom: calc(env(safe-area-inset-bottom) + 78px); right: 16px;
+      z-index: 998;
+      width: 44px; height: 44px;
+      background: ${COLORS.ink}; color: #fff;
+      border: none; border-radius: 999px; cursor: pointer;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+      display: flex; align-items: center; justify-content: center;
+      transition: transform 0.15s;
+    `;
+    btn.addEventListener('click', openPinnedSelector);
+    btn.addEventListener('touchstart', () => { btn.style.transform = 'scale(0.92)'; });
+    btn.addEventListener('touchend', () => { btn.style.transform = 'scale(1)'; });
+    document.body.appendChild(btn);
+  }
+
+  async function openPinnedSelector() {
+    const items = await loadPinnedItems();
+    const left = items.find((i) => i.slot === 'left' || (i.data && i.data.slot === 'left'));
+    const right = items.find((i) => i.slot === 'right' || (i.data && i.data.slot === 'right'));
+
+    // Mostrar mini-modal para escoger left o right
+    const m = createModal();
+    m.style.display = 'flex';
+    const content = m.querySelector('#pinned-modal-content');
+    const titleEl = m.querySelector('#pinned-modal-title');
+    titleEl.textContent = 'fotos destacadas';
+
+    const leftPhoto = await getPhotoUrlForItem(left);
+    const rightPhoto = await getPhotoUrlForItem(right);
+
+    content.innerHTML = `
+      <div style="padding: 18px;">
+        <p style="font-family: 'Fraunces', serif; font-style: italic; color: ${COLORS.inkSoft}; font-size: 14px; line-height: 1.5; margin-bottom: 18px;">
+          escoge cuál de las dos quieres ver, comentar, o gestionar.
+        </p>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          ${renderSlotButton(left, leftPhoto, 'left')}
+          ${renderSlotButton(right, rightPhoto, 'right')}
+        </div>
+      </div>
+    `;
+
+    content.querySelectorAll('[data-slot]').forEach((b) => {
+      b.addEventListener('click', () => {
+        const slotKey = b.getAttribute('data-slot');
+        const item = slotKey === 'left' ? left : right;
+        const url = slotKey === 'left' ? leftPhoto : rightPhoto;
+        openModal({ item: item || null, slot: slotKey, photoUrl: url });
+      });
+    });
+  }
+
+  function renderSlotButton(item, photoUrl, slotKey) {
+    const label = slotKey === 'left' ? 'izquierda' : 'derecha';
+    if (photoUrl) {
+      return `
+        <button data-slot="${slotKey}" style="
+          background: none; border: 1px solid ${COLORS.rule}; padding: 0;
+          cursor: pointer; overflow: hidden; aspect-ratio: 1;
+          position: relative;
+        ">
+          <img src="${escapeHtml(photoUrl)}" style="width: 100%; height: 100%; object-fit: cover; display: block;" />
+          <div style="position: absolute; bottom: 0; left: 0; right: 0; background: linear-gradient(transparent, rgba(0,0,0,0.7)); padding: 14px 10px 8px; color: #fff; font-family: 'Geist Mono', monospace; font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase; text-align: left;">${label}</div>
+        </button>
+      `;
+    }
+    return `
+      <button data-slot="${slotKey}" style="
+        background: ${COLORS.bg}; border: 1px dashed ${COLORS.rule}; padding: 0;
+        cursor: pointer; aspect-ratio: 1; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; color: ${COLORS.inkSofter};
+        font-family: 'Geist Mono', monospace; font-size: 10px;
+        letter-spacing: 0.2em; text-transform: uppercase;
+      ">
+        <div style="font-size: 26px; margin-bottom: 6px; opacity: 0.5;">+</div>
+        <div>${label}</div>
+        <div style="margin-top: 4px; opacity: 0.7;">vacío</div>
+      </button>
+    `;
+  }
+
+  async function getPhotoUrlForItem(item) {
+    if (!item) return null;
+    // photos puede ser un array de URLs o objetos
+    const photos = item.photos || (item.data && item.data.photos) || [];
+    if (Array.isArray(photos) && photos.length > 0) {
+      const first = photos[0];
+      if (typeof first === 'string') return first;
+      if (first && first.url) return first.url;
+      if (first && first.dataUrl) return first.dataUrl;
+    }
+    return null;
+  }
+
+  // ============================================================
+  // Init
+  // ============================================================
+  function init() {
+    // Esperar a que el DOM esté listo y React haya montado
+    let attempts = 0;
+    const tryInit = () => {
+      attempts++;
+      const root = document.getElementById('root');
+      if (root && root.children.length > 0) {
+        createFloatingButton();
+        console.log('[pinned-enhance] initialized');
+      } else if (attempts < 30) {
+        setTimeout(tryInit, 200);
+      }
+    };
+    tryInit();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+
+</script>
 </body>
 </html>
